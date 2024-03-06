@@ -1,0 +1,10 @@
+.idea
+cmd
+params
+pkg
+.gitignore
+Dockerfile
+go.mod
+go.sum
+Makefile
+README.md
