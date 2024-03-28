@@ -8,7 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	coreParams "github.com/smalls0098/proxy-download/params"
 	pkgApp "github.com/smalls0098/proxy-download/pkg/app"
-	pkgHttp "github.com/smalls0098/proxy-download/pkg/server/http"
+	pkgHttp "github.com/smalls0098/proxy-download/pkg/app/server/http"
 	"log"
 	"net"
 	"net/http"
