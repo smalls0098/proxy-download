@@ -105,6 +105,9 @@ type retryRoundTripper struct {
 
 func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req != nil {
+		req.RemoteAddr = ""
+		req.RequestURI = req.URL.RequestURI()
+		req.Host = req.URL.Host
 		req.Header.Del("X-Forwarded-For")
 		req.Header.Del("Host")
 		req.Header.Set("Host", req.URL.Host)
@@ -127,10 +130,10 @@ func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 			retryCount++
 			continue
 		}
-		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		if resp.StatusCode >= 300 && resp.StatusCode <= 302 {
 			req.URL, err = resp.Location()
 			if err != nil {
-				return nil, err
+				return resp, err
 			}
 			redirectCount++
 			continue
@@ -138,6 +141,7 @@ func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		if 200 < resp.StatusCode || resp.StatusCode >= 400 {
 			time.Sleep(500 * time.Millisecond)
 			retryCount++
+			log.Printf("statusCode: %d", resp.StatusCode)
 			continue
 		}
 		break
@@ -153,17 +157,20 @@ func proxy(server *httputil.ReverseProxy) gin.HandlerFunc {
 		ps := ctx.Query("p")
 		if len(ps) == 0 {
 			ctx.String(http.StatusBadRequest, "参数不能为空")
+			ctx.Abort()
 			return
 		}
 		params, err := coreParams.DecParams(ps, key)
 		if err != nil {
 			ctx.String(http.StatusBadGateway, "出现异常: %s", err.Error())
+			ctx.Abort()
 			return
 		}
 
 		reqUrl, err := url.Parse(params.Url)
 		if err != nil {
 			ctx.String(http.StatusBadGateway, "出现异常: %s", err.Error())
+			ctx.Abort()
 			return
 		}
 
