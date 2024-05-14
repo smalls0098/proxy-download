@@ -9,10 +9,11 @@ import (
 	coreParams "github.com/smalls0098/proxy-download/params"
 	pkgApp "github.com/smalls0098/proxy-download/pkg/app"
 	pkgHttp "github.com/smalls0098/proxy-download/pkg/app/server/http"
+	"golang.org/x/time/rate"
+	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"strconv"
@@ -42,32 +43,6 @@ func main() {
 	// 执行命令行
 	flag.Parse()
 
-	server := &httputil.ReverseProxy{
-		Rewrite:  nil,
-		Director: func(req *http.Request) {},
-		Transport: &retryRoundTripper{
-			transport: &http.Transport{
-				DialContext: (&net.Dialer{
-					Timeout:   20 * time.Second, // 请求超时
-					KeepAlive: 20 * time.Second, // 检测连接是否存活
-				}).DialContext,
-				ForceAttemptHTTP2:     true,             // 强制尝试http2
-				MaxIdleConns:          50,               // 最大空闲链接
-				IdleConnTimeout:       30 * time.Second, // 空闲链接时间
-				TLSHandshakeTimeout:   5 * time.Second,  // TLS握手超时时间
-				ExpectContinueTimeout: 5 * time.Second,
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
-				DisableKeepAlives: true,
-			},
-			maxRetries: 2,
-		},
-		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
-			log.Printf("ErrorHandler: %+v, url: %s", err, req.URL)
-		},
-	}
-
 	gin.SetMode(gin.ReleaseMode)
 	s := pkgHttp.NewServer(
 		gin.New(),
@@ -86,7 +61,7 @@ func main() {
 		ctx.String(http.StatusOK, "nw smalls\nok")
 	})
 
-	s.Any("/proxy", proxy(server))
+	s.Any("/proxy", handleProxy)
 
 	app := pkgApp.New(
 		pkgApp.WithServer(s),
@@ -98,86 +73,141 @@ func main() {
 	}
 }
 
-type retryRoundTripper struct {
-	transport  http.RoundTripper
-	maxRetries int
+var hc = &http.Client{
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 5 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return errors.New("stopped after 5 redirects")
+		}
+		return nil
+	},
 }
 
-func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req != nil {
-		req.RemoteAddr = ""
-		req.RequestURI = req.URL.RequestURI()
-		req.Host = req.URL.Host
-		req.Header.Del("X-Forwarded-For")
-		req.Header.Del("Host")
-		req.Header.Set("Host", req.URL.Host)
+var hopHeaders = []string{
+	"Connection",
+	"Proxy-Connection", // non-standard but still sent by libcurl and rejected by e.g. google
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",      // canonicalized version of "TE"
+	"Trailer", // not Trailers per URL above; https://www.rfc-editor.org/errata_search.php?eid=4522
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func handleProxy(ctx *gin.Context) {
+	f := ctx.Query("f")
+	ps := ctx.Query("p")
+	if len(ps) == 0 {
+		ctx.String(http.StatusBadRequest, "参数不能为空")
+		ctx.Abort()
+		return
 	}
-	var redirectCount = 0
-	var retryCount = 0
-	var resp *http.Response
-	var err error
-	for {
-		if redirectCount >= 3 {
-			return nil, errors.New("stopped after 3 redirects")
-		}
-		if retryCount >= 2 {
-			break
-		}
-		resp, err = r.transport.RoundTrip(req)
-		// retry
-		if err != nil {
-			time.Sleep(500 * time.Millisecond)
-			retryCount++
-			continue
-		}
-		if resp.StatusCode >= 300 && resp.StatusCode <= 302 {
-			req.URL, err = resp.Location()
+	params, err := coreParams.DecParams(ps, key)
+	if err != nil {
+		handleErr(ctx, err)
+		return
+	}
+	reqUrl, err := url.Parse(params.Url)
+	if err != nil {
+		handleErr(ctx, err)
+		return
+	}
+	log.Println(ctx.ClientIP() + " " + ctx.Request.Method + " " + reqUrl.String() + " " + ctx.Request.Proto + " " + ctx.Request.UserAgent())
+
+	req, err := http.NewRequest(ctx.Request.Method, reqUrl.String(), http.NoBody)
+	if err != nil {
+		handleErr(ctx, err)
+		return
+	}
+	req.Header = ctx.Request.Header.Clone()
+	req.Header.Del("Host")
+	req.Header.Del("Referer")
+	req.Header.Del("Origin")
+
+	res, err := hc.Do(req)
+	if err != nil {
+		handleErr(ctx, err)
+		return
+	}
+	defer res.Body.Close()
+
+	// 重定向
+	if res.StatusCode >= 300 && res.StatusCode < 400 {
+		if location, _ := res.Location(); location != nil {
+			loc := location.String()
+			loc, err = coreParams.Gen(loc, f, params, key)
 			if err != nil {
-				return resp, err
+				handleErr(ctx, err)
+				return
 			}
-			redirectCount++
-			continue
+			ctx.Redirect(res.StatusCode, loc)
+			return
 		}
-		if 200 < resp.StatusCode || resp.StatusCode >= 400 {
-			time.Sleep(500 * time.Millisecond)
-			retryCount++
-			log.Printf("statusCode: %d", resp.StatusCode)
-			continue
+	}
+
+	// 设置headers
+	resHr := res.Header.Clone()
+	for _, k := range hopHeaders {
+		resHr.Del(k)
+	}
+	for k, v := range resHr {
+		for _, vv := range v {
+			ctx.Writer.Header().Add(k, vv)
 		}
-		break
 	}
-	if err == nil && resp == nil {
-		return nil, errors.New("出现异常: resp is nil")
+
+	ctx.Status(res.StatusCode)
+	if ctx.Request.Method == http.MethodHead {
+		return
 	}
-	return resp, err
+
+	if params.Tag == 1 {
+		// 无限制
+		_, err = io.Copy(ctx.Writer, res.Body)
+	} else {
+		// 默认限制，每秒1M
+		_, err = io.Copy(ctx.Writer, &rateLimitedReader{
+			ctx:     ctx,
+			reader:  res.Body,
+			limiter: rate.NewLimiter(rate.Limit(1024*1024), 1024*1024),
+		})
+	}
+	if err != nil {
+		handleErr(ctx, err)
+		return
+	}
 }
 
-func proxy(server *httputil.ReverseProxy) gin.HandlerFunc {
-	return func(ctx *gin.Context) {
-		ps := ctx.Query("p")
-		if len(ps) == 0 {
-			ctx.String(http.StatusBadRequest, "参数不能为空")
-			ctx.Abort()
-			return
-		}
-		params, err := coreParams.DecParams(ps, key)
-		if err != nil {
-			ctx.String(http.StatusBadGateway, "出现异常: %s", err.Error())
-			ctx.Abort()
-			return
-		}
+func handleErr(ctx *gin.Context, err error) {
+	ctx.String(http.StatusBadGateway, "出现异常: %s", err.Error())
+	ctx.Abort()
+}
 
-		reqUrl, err := url.Parse(params.Url)
-		if err != nil {
-			ctx.String(http.StatusBadGateway, "出现异常: %s", err.Error())
-			ctx.Abort()
-			return
-		}
+type rateLimitedReader struct {
+	ctx     context.Context
+	reader  io.Reader
+	limiter *rate.Limiter
+}
 
-		// 请求体
-		req := ctx.Request.Clone(ctx.Request.Context())
-		req.URL = reqUrl
-
-		server.ServeHTTP(ctx.Writer, req)
+func (r *rateLimitedReader) Read(p []byte) (n int, err error) {
+	err = r.limiter.WaitN(r.ctx, len(p))
+	if err != nil {
+		return 0, err
 	}
+	return r.reader.Read(p)
 }
